@@ -148,6 +148,66 @@ EOF
   rm -r ${tmp_dir}
 }
 
+function create_tls_secret_and_ca() {
+  local secret_name=${1:?}
+  local secret_namespace=${2:?}
+  local tls_cn=${3:?}
+  local ca_secret_name=${4:?}
+
+  tmp_dir=$(mktemp -d -t cf-tls-XXXXXX)
+
+  if [[ "${OPENSSL_VERSION}" == "OpenSSL" ]]; then
+    openssl genrsa -out ${tmp_dir}/ca.key 2048
+    openssl req -new -x509 -nodes \
+      -days 365 \
+      -key ${tmp_dir}/ca.key \
+      -out ${tmp_dir}/ca.pem \
+      -subj "/CN=unused"
+
+    openssl genrsa -out ${tmp_dir}/server.key 2048
+    openssl req -new \
+      -key ${tmp_dir}/server.key \
+      -out ${tmp_dir}/server.csr \
+      -subj "/CN=${tls_cn}" \
+      -addext "subjectAltName = DNS:${tls_cn}"
+    openssl x509 -req \
+      -days 365 \
+      -set_serial 01 \
+      -in ${tmp_dir}/server.csr  \
+      -out ${tmp_dir}/server.pem \
+      -CA ${tmp_dir}/ca.pem  \
+      -CAkey ${tmp_dir}/ca.key
+    cat ${tmp_dir}/ca.pem >> ${tmp_dir}/server.pem
+  else
+    echo "FAIL: please upgrade your openssl"
+    exit 1
+  fi
+
+  cat <<EOF >${tmp_dir}/kustomization.yml
+secretGenerator:
+- name: ${secret_name}
+  namespace: ${secret_namespace}
+  files:
+  - tls.crt=server.pem
+  - tls.key=server.key
+  type: "kubernetes.io/tls"
+- name: ${ca_secret_name}
+  namespace: ${secret_namespace}
+  files:
+  - tls.crt=ca.pem
+  - tls.key=ca.key
+  - ca.crt=ca.pem
+  type: "kubernetes.io/tls"
+generatorOptions:
+  disableNameSuffixHash: true
+EOF
+
+  kubectl apply -k $tmp_dir
+
+  rm -r ${tmp_dir}
+}
+
+
 # undo *_IMG changes in config and reference
 function clean_up_img_refs() {
   cd "${ROOT_DIR}"
@@ -305,6 +365,7 @@ function deploy_korifi_api() {
       make deploy-api-kind
     fi
 
+    create_tls_secret_and_ca "korifi-api-backplane-cert" "korifi-api-system" "cf-k8s-api-svc.cf-k8s-api-system.service.cluster.local" "korifi-api-backplane-ca"
     create_tls_secret "korifi-api-ingress-cert" "korifi-api-system" "localhost"
   }
   popd >/dev/null
